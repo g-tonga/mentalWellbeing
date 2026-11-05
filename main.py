@@ -3,16 +3,25 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from enum import Enum
+from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
+import screening
+from resources import CRISIS_RESOURCES
+
 logger = logging.getLogger("wellbeing-agent")
 logging.basicConfig(level=logging.INFO)
 
-MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]  # primary, then fallback
+MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash-lite").split(",")
+]
 
 FALLBACK_TIP = (
     "Take a few slow breaths, step outside for a short walk, "
@@ -21,12 +30,18 @@ FALLBACK_TIP = (
 
 SYSTEM_PROMPT = (
     "You are an empathetic, non-clinical mental wellbeing first-aid assistant. "
-    "You are not a doctor and must never diagnose. Given wearable signals, "
-    "suggest ONE gentle, low-friction micro-intervention (a short walk, "
-    "journaling, messaging a friend). Warm tone, max 3 sentences. "
+    "You are not a doctor and must never diagnose. You receive only the signals "
+    "the user chose to share; never ask for or mention missing ones. Suggest ONE "
+    "gentle, low-friction micro-intervention (a short walk, journaling, messaging "
+    "a friend, calming music). Warm tone, max 3 sentences. "
     "If the user may be in danger, encourage contacting a trusted person or "
     "local emergency services."
 )
+
+
+class Region(str, Enum):
+    AE = "AE"
+    KE = "KE"
 
 
 class Activity(str, Enum):
@@ -36,19 +51,20 @@ class Activity(str, Enum):
     sleeping = "sleeping"
 
 
-class CommFrequency(str, Enum):
-    high = "high"
-    normal = "normal"
-    low = "low"
-    none = "none"
-
-
 class WearableTelemetry(BaseModel):
-    user_id: str = Field(min_length=1, max_length=64)
-    heart_rate_bpm: int = Field(ge=20, le=250)
-    activity_state: Activity
-    indoor_steps_last_4_hours: int = Field(ge=0, le=50_000)
-    communication_frequency: CommFrequency
+    # Random per-session token. No name, phone number or device ID is ever sent.
+    session_id: str = Field(min_length=8, max_length=64)
+    region: Region = Region.AE
+    # Every signal is optional: a signal the user switched off is simply absent.
+    heart_rate_bpm: int | None = Field(default=None, ge=20, le=250)
+    activity_state: Activity | None = None
+    indoor_steps_last_4_hours: int | None = Field(default=None, ge=0, le=50_000)
+
+
+class ScoreRequest(BaseModel):
+    instrument: screening.InstrumentId
+    answers: list[Annotated[int, Field(ge=0, le=3)]]
+    region: Region = Region.AE
 
 
 @asynccontextmanager
@@ -63,22 +79,52 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Wearable Mental Wellbeing AI Agent", lifespan=lifespan)
 
 
+def emergency_numbers(region: Region) -> str:
+    items = CRISIS_RESOURCES[region.value]["emergency"]
+    return " or ".join(f'{i["number"]} ({i["label"].lower()})' for i in items)
+
+
+def has_signal(d: WearableTelemetry) -> bool:
+    return any(
+        v is not None
+        for v in (d.heart_rate_bpm, d.activity_state, d.indoor_steps_last_4_hours)
+    )
+
+
 def is_crisis(d: WearableTelemetry) -> bool:
-    # Only flag a high heart rate when the body should be calm
-    return d.heart_rate_bpm > 140 and d.activity_state in (
-        Activity.resting,
-        Activity.sleeping,
+    # Only flag a very high heart rate when the body should be calm
+    return (
+        d.heart_rate_bpm is not None
+        and d.heart_rate_bpm > 140
+        and d.activity_state in (Activity.resting, Activity.sleeping)
     )
 
 
-def needs_ai_check(d: WearableTelemetry) -> bool:
+def needs_checkin(d: WearableTelemetry) -> bool:
     # Placeholder thresholds: tune these with real data
-    stressed = d.heart_rate_bpm > 100 and d.activity_state == Activity.resting
-    isolated = d.indoor_steps_last_4_hours < 500 and d.communication_frequency in (
-        CommFrequency.low,
-        CommFrequency.none,
+    stressed = (
+        d.heart_rate_bpm is not None
+        and d.heart_rate_bpm > 100
+        and d.activity_state == Activity.resting
     )
-    return stressed or isolated
+    low_movement = (
+        d.indoor_steps_last_4_hours is not None
+        and d.indoor_steps_last_4_hours < 500
+        and d.activity_state in (None, Activity.resting)
+    )
+    return stressed or low_movement
+
+
+def build_prompt(d: WearableTelemetry) -> str:
+    # Data minimisation: only shared signals go to the model, nothing identifying.
+    lines = []
+    if d.heart_rate_bpm is not None:
+        lines.append(f"Heart rate: {d.heart_rate_bpm} BPM")
+    if d.activity_state is not None:
+        lines.append(f"Activity: {d.activity_state.value}")
+    if d.indoor_steps_last_4_hours is not None:
+        lines.append(f"Steps in last 4 hours: {d.indoor_steps_last_4_hours}")
+    return "\n".join(lines)
 
 
 async def generate_with_retry(client: genai.Client, prompt: str) -> str | None:
@@ -98,50 +144,73 @@ async def generate_with_retry(client: genai.Client, prompt: str) -> str | None:
                 break  # empty reply: try next model
             except errors.ServerError as e:  # 5xx: overloaded or unavailable
                 logger.warning("%s attempt %d failed: %s", model, attempt + 1, e)
-                await asyncio.sleep(2**attempt)  # wait 1s, 2s, 4s
+                await asyncio.sleep(2**attempt)
             except errors.ClientError as e:  # 4xx: bad key, bad model name, etc.
                 logger.error("%s client error: %s", model, e)
-                break  # retrying won't help, move to next model
+                break
+            except Exception:
+                logger.exception("%s unexpected error", model)
+                await asyncio.sleep(2**attempt)
     return None
 
 
 @app.post("/api/analyze-telemetry")
 async def analyze_telemetry(data: WearableTelemetry):
+    # Privacy: telemetry is never stored or logged. It lives only for this request.
+    if not has_signal(data):
+        return {
+            "status": "no_data",
+            "suggest_checkin": False,
+            "message": "No signals shared. Turn on at least one sensor to get insights.",
+        }
+
     if is_crisis(data):
         return {
             "status": "alert",
-            "intervention_type": "crisis_support",
+            "suggest_checkin": False,
             "message": (
                 "Your heart rate is very high while you're at rest. Please pause "
                 "and take slow, deep breaths. If you feel unwell or unsafe, "
-                "contact emergency services (112 or 999 in Kenya) or someone "
-                "near you right away."
+                f"contact emergency services ({emergency_numbers(data.region)}) "
+                "or someone near you right away."
             ),
         }
 
-    if not needs_ai_check(data):
-        return {"status": "ok", "message": "Your signals look steady. Keep it up!"}
-
-    prompt = (
-        f"Heart rate: {data.heart_rate_bpm} BPM\n"
-        f"Activity: {data.activity_state.value}\n"
-        f"Steps in last 4 hours: {data.indoor_steps_last_4_hours}\n"
-        f"Communication frequency: {data.communication_frequency.value}"
-    )
-
-    text = await generate_with_retry(app.state.client, prompt)
-    if text is None:
+    if not needs_checkin(data):
         return {
-            "status": "fallback",
-            "ai_first_aid_recommendation": FALLBACK_TIP,
+            "status": "ok",
+            "suggest_checkin": False,
+            "message": "Your signals look steady. Keep it up!",
         }
 
-    return {
-        "status": "success",
-        "ai_first_aid_recommendation": text,
-    }
+    text = await generate_with_retry(app.state.client, build_prompt(data))
+    if text is None:
+        return {"status": "fallback", "suggest_checkin": True, "message": FALLBACK_TIP}
+    return {"status": "success", "suggest_checkin": True, "message": text}
+
+
+@app.get("/api/screening/instruments")
+def get_instruments():
+    return screening.public_definitions()
+
+
+@app.post("/api/screening/score")
+def score_screening(req: ScoreRequest):
+    # Privacy: answers are scored in memory and never stored or logged.
+    try:
+        result = screening.score(req.instrument, req.answers)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if result["urgent"]:
+        result["crisis_resources"] = CRISIS_RESOURCES[req.region.value]
+    return result
+
+
+@app.get("/health")
+def health():
+    return {"message": "Backend is running!"}
 
 
 @app.get("/")
 def home():
-    return {"message": "Backend is running!"}
+    return FileResponse(Path(__file__).parent / "index.html")
