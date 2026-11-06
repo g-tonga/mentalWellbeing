@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Counsellor view (demo)</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f4efe6;
+        --card: #fbf9f4;
+        --ink: #1d2b25;
+        --muted: #66756b;
+        --line: #e4ddcf;
+        --green: #27483c;
+        --on-green: #f3efe4;
+        --alert: #c4412c;
+        --warn: #b97d12;
+        --ok: #2f8a58;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111912;
+          --card: #19241d;
+          --ink: #ece9de;
+          --muted: #9db0a2;
+          --line: #26352b;
+          --green: #2c5344;
+          --alert: #f08673;
+          --warn: #e6b450;
+          --ok: #5fd08e;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font:
+          16px/1.5 "Segoe UI",
+          system-ui,
+          sans-serif;
+      }
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 20px;
+        display: grid;
+        gap: 14px;
+      }
+      h1 {
+        font-family: Georgia, serif;
+        font-weight: 500;
+        margin: 0;
+      }
+      .banner {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-left: 6px solid var(--warn);
+        border-radius: 14px;
+        padding: 10px 14px;
+        font-size: 0.9rem;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 14px;
+        display: grid;
+        gap: 6px;
+      }
+      .card.crisis {
+        border-left: 6px solid var(--alert);
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .badge {
+        padding: 2px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        font-size: 0.8rem;
+        font-weight: 600;
+        text-transform: capitalize;
+      }
+      .badge.new {
+        border-color: var(--alert);
+        color: var(--alert);
+      }
+      .badge.acknowledged {
+        border-color: var(--warn);
+        color: var(--warn);
+      }
+      .badge.contacted {
+        border-color: var(--ok);
+        color: var(--ok);
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      input,
+      button {
+        font: inherit;
+      }
+      input {
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        flex: 1;
+        min-width: 180px;
+      }
+      button {
+        cursor: pointer;
+        border: 0;
+        border-radius: 999px;
+        padding: 9px 16px;
+        font-weight: 600;
+        background: var(--green);
+        color: var(--on-green);
+      }
+      button.ghost {
+        background: transparent;
+        color: var(--ink);
+        border: 1px solid var(--line);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      :focus-visible {
+        outline: 3px solid var(--warn);
+        outline-offset: 2px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Counsellor view</h1>
+      <p class="banner">
+        Demo view. Cases are held in memory for 24 hours and cleared when the
+        server restarts. The access code is printed in the terminal where
+        uvicorn is running.
+      </p>
+
+      <div class="row" id="login">
+        <input
+          id="code"
+          type="password"
+          placeholder="Counsellor access code"
+          aria-label="Counsellor access code"
+          autocomplete="off"
+        />
+        <button id="enter" type="button">Open queue</button>
+      </div>
+      <p class="muted" id="msg" role="status"></p>
+      <div id="list" style="display: grid; gap: 12px"></div>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let code = "";
+      try {
+        code = sessionStorage.getItem("cc") || "";
+      } catch (e) {
+        /* storage blocked */
+      }
+      let timer = null;
+
+      function el(tag, props = {}, ...kids) {
+        const n = document.createElement(tag);
+        Object.assign(n, props);
+        kids.forEach((k) => n.append(k));
+        return n;
+      }
+
+      async function api(path, options = {}) {
+        const res = await fetch(path, {
+          ...options,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Counsellor-Code": code,
+            ...(options.headers || {}),
+          },
+        });
+        return res;
+      }
+
+      async function setStatus(id, status) {
+        const res = await api("/api/counsellor/cases/" + id + "/status", {
+          method: "POST",
+          body: JSON.stringify({ status }),
+        });
+        if (!res.ok) $("msg").textContent = "Could not update that case.";
+        load();
+      }
+
+      function fmt(iso) {
+        return iso
+          ? new Date(iso).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "";
+      }
+
+      function card(c) {
+        const box = el("div", {
+          className: "card" + (c.crisis_flag ? " crisis" : ""),
+        });
+        box.append(
+          el(
+            "div",
+            { className: "row" },
+            el("strong", { textContent: c.reason }),
+            el("span", {
+              className: "badge " + c.status,
+              textContent: c.status,
+            }),
+          ),
+        );
+        box.append(
+          el("div", {
+            className: "muted",
+            textContent:
+              c.instrument +
+              " | " +
+              c.band +
+              " range | region " +
+              c.region +
+              " | prefers: " +
+              c.channel,
+          }),
+        );
+        box.append(
+          el("div", {
+            textContent: "Contact: " + (c.contact_hint || "not provided"),
+          }),
+        );
+        const times = ["Requested " + fmt(c.created_at)];
+        if (c.waiting_minutes !== null)
+          times.push("waiting " + c.waiting_minutes + " min");
+        if (c.acknowledged_at) times.push("seen " + fmt(c.acknowledged_at));
+        if (c.contacted_at) times.push("contacted " + fmt(c.contacted_at));
+        box.append(
+          el("div", { className: "muted", textContent: times.join(" | ") }),
+        );
+        const actions = el("div", {
+          className: "row",
+          style: "justify-content:flex-start",
+        });
+        const ack = el("button", {
+          type: "button",
+          textContent: "Acknowledge",
+          disabled: c.status !== "new",
+        });
+        const done = el("button", {
+          type: "button",
+          className: "ghost",
+          textContent: "Mark contacted",
+          disabled: c.status === "contacted",
+        });
+        ack.addEventListener("click", () => setStatus(c.id, "acknowledged"));
+        done.addEventListener("click", () => setStatus(c.id, "contacted"));
+        actions.append(ack, done);
+        box.append(actions);
+        return box;
+      }
+
+      async function load() {
+        if (!code) return;
+        try {
+          const res = await api("/api/counsellor/cases");
+          if (res.status === 401) {
+            $("msg").textContent = "That code is not valid.";
+            clearInterval(timer);
+            timer = null;
+            return;
+          }
+          if (!res.ok) throw new Error("status " + res.status);
+          const { cases } = await res.json();
+          $("msg").textContent = cases.length
+            ? cases.length + " case(s)"
+            : "No cases right now.";
+          $("list").replaceChildren(...cases.map(card));
+        } catch (e) {
+          $("msg").textContent = "Could not load the queue.";
+        }
+      }
+
+      function start() {
+        code = $("code").value.trim() || code;
+        try {
+          sessionStorage.setItem("cc", code);
+        } catch (e) {
+          /* ignore */
+        }
+        clearInterval(timer);
+        load();
+        timer = setInterval(load, 4000);
+      }
+
+      $("enter").addEventListener("click", start);
+      $("code").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") start();
+      });
+      if (code) {
+        timer = setInterval(load, 4000);
+        load();
+      }
+    </script>
+  </body>
+</html>

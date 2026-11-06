@@ -12,11 +12,15 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
+import escalation
+import navigation
 import screening
-from resources import CRISIS_RESOURCES
+from resources import CRISIS_RESOURCES, Region
 
 logger = logging.getLogger("wellbeing-agent")
 logging.basicConfig(level=logging.INFO)
+
+BASE_DIR = Path(__file__).parent
 
 MODELS = [
     m.strip()
@@ -37,11 +41,6 @@ SYSTEM_PROMPT = (
     "If the user may be in danger, encourage contacting a trusted person or "
     "local emergency services."
 )
-
-
-class Region(str, Enum):
-    AE = "AE"
-    KE = "KE"
 
 
 class Activity(str, Enum):
@@ -73,10 +72,12 @@ async def lifespan(app: FastAPI):
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     app.state.client = genai.Client(api_key=api_key)
+    escalation.announce_code()
     yield
 
 
 app = FastAPI(title="Wearable Mental Wellbeing AI Agent", lifespan=lifespan)
+app.include_router(escalation.router)
 
 
 def emergency_numbers(region: Region) -> str:
@@ -203,6 +204,9 @@ def score_screening(req: ScoreRequest):
         raise HTTPException(status_code=422, detail=str(e))
     if result["urgent"]:
         result["crisis_resources"] = CRISIS_RESOURCES[req.region.value]
+    result["support_plan"] = navigation.build_support_plan(
+        result["band"], req.region.value, result["crisis_flag"], result["urgent"]
+    )
     return result
 
 
@@ -211,6 +215,16 @@ def health():
     return {"message": "Backend is running!"}
 
 
+@app.get("/support.js")
+def support_js():
+    return FileResponse(BASE_DIR / "support.js", media_type="application/javascript")
+
+
+@app.get("/counsellor")
+def counsellor_page():
+    return FileResponse(BASE_DIR / "counsellor.html")
+
+
 @app.get("/")
 def home():
-    return FileResponse(Path(__file__).parent / "index.html")
+    return FileResponse(BASE_DIR / "index.html")

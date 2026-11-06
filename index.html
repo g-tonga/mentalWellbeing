@@ -1197,6 +1197,7 @@
         parts.push("What this means. " + d.what_it_means);
         parts.push("What this does not mean. " + d.what_it_does_not_mean);
         parts.push("Suggested next step. " + d.next_step);
+        if (d.support_plan) parts.push(d.support_plan.rationale);
         return parts;
       }
 
@@ -1612,6 +1613,7 @@
         renderSupport(data);
         lastParts = buildScript(data, inst.title.toLowerCase());
         $("audioCard").hidden = !HAS_TTS;
+        if (window.Support) Support.render(data);
       }
 
       function renderSupport(data) {
@@ -1886,5 +1888,6 @@
       loadDefs();
       showView("home");
     </script>
+    <script src="/support.js"></script>
   </body>
 </html>
